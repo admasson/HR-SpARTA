@@ -5,4 +5,4 @@ COMING SOON: HR-SpARTA, for "High Resolution Spectral Analysis of Remote Transit
 - measure atmospheric escape through the metastable helium triplet line using our custom parker-wind 1D NLTE radiative transfer code (compatible with p-winds hydrodynamical module)
 - analyze high-resolution spectroscopic data for molecular detection using the CCF method
 
-These tools are undergoing their final test phase and will progressively be published here along with their associated publications.
+These tools are undergoing their final test phase and will progressively be published here along with references to their associated publications.
