@@ -76,7 +76,7 @@ pandas==2.2.3
 pandocfilters==1.5.1
 parso==0.8.4
 patsy==1.0.1
-petitRADTRANS==3.1.2
+# petitRADTRANS==3.1.2
 pexpect==4.9.0
 pillow==11.1.0
 platformdirs==4.3.7
