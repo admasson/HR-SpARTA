@@ -89,15 +89,41 @@ def div_by_moving_average(spectrum,area):
     # return result
     return spectrum / data_convolved
 
+def split_param_combinations(param_arrays, num_splits):
+    """
+    Given a list of parameter arrays and a number of splits,
+    this function generates all possible combinations of the indices
+    of the parameter arrays and splits these combinations into
+    num_splits nearly equal parts.
+    
+    Parameters:
+        param_arrays (list of np.array): List of 1D numpy arrays, each representing parameter values.
+        num_splits (int): Number of parts to split the combinations into.
+        
+    Returns:
+        list of np.array: A list containing num_splits 2D arrays. Each array has rows that represent
+                          a unique combination of indices from the parameter arrays.
+    """
+    # 1. Create index arrays for each parameter
+    indices = [np.arange(len(arr)) for arr in param_arrays]
+    
+    # 2. Generate all possible combinations using meshgrid
+    grid = np.meshgrid(*indices, indexing='ij')
+    combinations = np.stack(grid, axis=-1).reshape(-1, len(param_arrays))
+    
+    # 3. Split the combinations into num_splits parts
+    split_combinations = np.array_split(combinations, num_splits)
+    
+    return split_combinations
 
 class AtmoModel:
     def __init__(self,
                  data_set,
-                 species,
+                 species=[], # note required if we use an interpoler
                  pressure=np.logspace(-8, 2, 130),
                  ref_pressure = 1e-2,   # ref pressure at which planet's radius & logg are defined. This is pRT default value in documentation
-                 load_pRT=True,         # Can be set to False if we use an interpolation grid, since in this case we don't need to load the opacity grids from pRT
                  lbl_sampling=1,
+                 interpoler_path = None, # if a path is set then we'll use the provided interpoler instead of pRT 
                  ):
         
         '''
@@ -144,7 +170,7 @@ class AtmoModel:
     
         # Setup petitRADTRANS atmosphere model with random values for the free parameters (will be updated when computing spectrum)
         # this avoid reloading all files each time a new model is computed and faster computation
-        if load_pRT:
+        if interpoler_path is None:
 
             self.spectral_model = SpectralModel(
                 # Radtrans parameters
@@ -178,7 +204,19 @@ class AtmoModel:
         # In the case where we don't want to compute petitRADTRANS directly but interpolate on a grid instead
         else:
             self.spectral_model = None
-            print('You decided not to load the pRT spectrum: you MUST use an interpolation grid to compute the pRT spectrum !')
+            print(f'Loading interpoler: {interpoler_path} ')
+            # load interpolator
+            with open(interpoler_path, 'rb') as f:
+                self.pRT_interpolator = pickle.load(f)
+            # there should be a corresponding interpolator readme in the same folder, check for it
+            with open(interpoler_path.replace('.pkl','_readme.txt'),'r') as f:
+                self.pRT_interpolator_readme = f.readlines()
+            print('Here\'s the associated readme: make sure to set the atmospheric parameter in the same order and within the pre-computed interpolation grid!')
+            print(self.pRT_interpolator_readme)
+            # load corresponding wavelength
+            self.pRT_interpolator_wave = np.loadtxt(interpoler_path.replace('.pkl','_wave.dat'))
+            print(f'{interpoler_path} succesfully loaded, synthetic will be interpolated instead of direct computation')
+        
 
     def compute_pRT(self, atmo_parameters={}, plot=False, save=False, save_dir=''):
         '''
@@ -241,8 +279,35 @@ class AtmoModel:
         # return the model: wavelength in nm, and transit apparent radius (planet bulk asborption + atmosphere) in meters
         return(wave,model)      
 
+    def interpolate_pRT(self, atmo_parameters={}, plot=False, save=False, save_dir=''):
+        '''
+        compute the pRT model using a given interpoler precomputed over a grid instead of direct model calculation
+        '''
+        # build parameters: we read the parameters name in the right order of grid dimension from the readme, and attribute the corresponding values from the given atmo_parameter dic
+        if self.pRT_interpolator is None:
+            raise NameError('You must first load an interpolator with .load_interp_pRT()')
+        
+        # extract parameters from dictionnary
+        params = []
+        for key,value in atmo_parameters.items():
+            if key=='log_MMR':
+                for subkey, subval in atmo_parameters[key].items():
+                    params.append(subval)
+            else:
+                params.append(value)
+
+        transit_radius = self.pRT_interpolator(tuple(params))
+
+        # plot ?
+        if plot:
+            plt.figure()
+            plt.plot(self.pRT_interpolator_wave,transit_radius)
+
+        # return wave & model
+        return(self.pRT_interpolator_wave,transit_radius)
+
     def compute_synthetic(self, Kp, V0, atmo_parameters={}, 
-                          mav_area=None, interpolate_pRT=False, apply_svd=False, plot=False, lower_to_instrument_resolution=False, accurate_sampling=False, verbose=True):
+                          mav_area=None, apply_svd=False, plot=False, lower_to_instrument_resolution=False, accurate_sampling=False, verbose=True):
 
         '''
         Kp, V0 -> m/s
@@ -254,13 +319,13 @@ class AtmoModel:
         log_MMR : dictionnary {'specie': log abundance in MMR}
         '''
 
-        if apply_svd and (data_set is None): raise NameError('You must give a DataSet class object with apply_svd in its reduction history as "data_set" argument when apply_svd is True')
+        if apply_svd and (self.data_set is None): raise NameError('You must give a DataSet class object with apply_svd in its reduction history as "data_set" argument when apply_svd is True')
 
         # Compute petitRADTRANS model
-        if interpolate_pRT: 
-            raise NameError('To do')
-        else:
+        if self.pRT_interpolator is None: 
             wave_model,transit_radius = self.compute_pRT(atmo_parameters,plot)
+        else:
+            wave_model,transit_radius = self.interpolate_pRT(atmo_parameters,plot)
 
         # Lower to instrumental resolution            
         if not lower_to_instrument_resolution:
@@ -311,12 +376,13 @@ class AtmoModel:
                 plt.legend()
 
             # compute transmission with window weight & store
-            synthetic[obs] = 1 - self.transit_weight[obs]*((transit_resampled-self.transit['Rp'])**2 / self.transit['Rs']**2) # should we remove the planet's bulk absorption here ?
+            # synthetic[obs] = 1 - self.transit_weight[obs]*((transit_resampled-self.transit['Rp'])**2 / self.transit['Rs']**2) # should we remove the planet's bulk absorption here : NO !            
+            synthetic[obs] = 1 - self.transit_weight[obs]*(transit_resampled**2 / self.transit['Rs']**2) # -> this one works for Nested Sampling & CCF !
 
         # plot synthetic time series before post-processing (div by mav & SVD)
         if plot:
             plt.figure()
-            plt.imshow(synthetic.reshape(self.shape[0],self.shape[1]*self.shape[2]), aspect='auto', origin='lower')
+            plt.imshow(synthetic.reshape(self.shape[0],self.shape[1]*self.shape[2]), aspect='auto', origin='lower', vmin=synthetic[obs-5].min()*0.999,vmax=synthetic[obs-5].max()*1.001)
             plt.colorbar()
 
         if plot: 
@@ -472,8 +538,8 @@ class AtmoModel:
                     transit_shifted_and_resampled = interp1d(wave_shifted,transit_radius,bounds_error=False,fill_value=np.nan)(self.data_wave) # Here we both shift oversampled spectrum & resampled on data wave bin, with no guarantee on conserving flux !
 
                 # apply transit weight
-                synthetic = 1 - self.transit_weight[:,None,None]*((transit_shifted_and_resampled-self.transit['Rp'])**2 / self.transit['Rs']**2)[None,:] # should we remove the planet's bulk absorption here ?
-                
+                synthetic = 1 - self.transit_weight[:,None,None]*((transit_shifted_and_resampled)**2 / self.transit['Rs']**2)[None,:] # should we remove the planet's bulk absorption here ?
+
                 # apply div by weighted avergage on in-transit data
                 if mav_area is not None: synthetic[self.transit_weight>0] = div_by_moving_average(synthetic[self.transit_weight>0],mav_area)
 
@@ -569,38 +635,9 @@ class AtmoModel:
                 progress[0] += 1
             print(f'\r{100*progress[0]/(NKp*NV0):.0f} %',end='',flush=True)
 
-        def CCF_KpV0_parallel(result,index_list):
-            global counter
-            for i in index_list:
-                Kp = Kp_range[i]
-                temp = np.zeros_like(result['data*model'][i])
-                for j,V0 in enumerate(V0_range):
-                    temp[j] = interpolateCCF(Kp,V0)
-                with lock:
-                    result['data*model'][i] = temp
-                    counter += 1
-                    print(f'\r{counter+1}/{NKp}',end='',flush=True)
-
         result = {}
         result['data*model'] = np.zeros((NKp,NV0))
 
-        # # interpolate in (Kp,V0) space with multiprocess
-        # tstart = time.time()
-        # if Nb_threads: # if parallelization
-        #     num_threads = Nb_threads
-        #     threads = []
-        #     # Divide the Kp array in equal parts (one per thread)
-        #     index_sub_arrays = np.array_split(np.arange(NKp), num_threads)
-        #     # Assign each thread with one part of the array
-        #     for thread_idx in range(num_threads):
-        #         index_list = index_sub_arrays[thread_idx] # list of index (in Vtot range & CCF) the thread will work with
-        #         thread = threading.Thread(target=CCF_KpV0_parallel, args=(result,index_list))
-        #         threads.append(thread)
-        #         thread.start()
-        #     # Wait for all threads to finish
-        #     for thread in threads:
-        #         thread.join()
-        # else: # without parallelisation
         progress = np.zeros((1))
         for i,Kp in enumerate(Kp_range):
             ComputeCCF(result,i,Kp,V0_range,progress)
@@ -621,6 +658,9 @@ class AtmoModel:
         result['params']['V0_ref']   = V0_ref  
         result['params']['Kp_range'] = Kp_range
         result['params']['V0_range'] = V0_range
+        result['params']['Vsys'] = self.Vsys
+        result['params']['BERV'] = self.BERV
+        result['params']['Vp'] = self.Vp_ref
 
         ### compute significance map ###
         CCF = np.copy(result['data*model'])
@@ -671,7 +711,156 @@ class AtmoModel:
 
         return(result,CCF/noise_CCF)
 
+    def build_interpolation_grid(self,params_range,Nb_threads,output_file, skip_memory_check=False):
+        '''
+        Build an interpolation grid for fast computation of petitRADTRANS spectra.
+        The output is a N-D linear interpoler which provides fast computation of the transit radius for a given exoplanet.
+
+        - params_range: a dictionnary with the same key as the atmo_params dictionnary to compute a pRT spectrum, but with a range of parameters instead of a single value:
+        example -> params_range = {
+                                    'Tiso': np.linspace(500,5000,10),
+                                    'log_MMR': {
+                                        'H2O': np.arange(-8,2,1),
+                                        'CO' : np.arange(-8,2,,1)},
+                                    'log_Pcloud': np.arange(-8,2,1),
+                                  }
+
+        - Nb_thread: number of thread to use for computing the grid. 0 = no parallelisation
+
+        - output_file: path + name of the output file in which the grid will be stored (in pickle format)                                  
+        '''
+        global counter
+
+        # compute a single dummy model to get its size
+        t0 = time.time()
+        print('Computing a dummy model to get wavelength & model size...')
+        dummy_wave, dummy_model = self.compute_pRT({'Tiso':500,'log_MMR':{'H2O':-8}})
+        print(f'Single model computed in {time.time()-t0:.2f} s')
+
+        # unfold the log_MMR dictionnary (if any) in the main dictionnary
+        parameters = {}
+        for key in params_range:
+            if key=='log_MMR':
+                for sub_key in params_range[key]:
+                    parameters[f'log_MMR_{sub_key}'] = params_range[key][sub_key]
+            else:
+                parameters[key] = params_range[key]
+
+        # get size of grid
+        Ndim = []
+        for key, value in parameters.items():
+            Ndim.append(len(value))
+            print(f'Found {Ndim[-1]} {key} values')
         
+        Ntot = np.prod(Ndim) # total number of points in grid
+
+        print('Grid size: ' + 'x'.join([str(el) for el in Ndim]) + f'x{dummy_model.size}, {Ntot} parameter values in total')
+        print(f'Expected memory usage: {Ntot*dummy_model.nbytes/(1024**3):.2f} Gb.')
+        
+        if not skip_memory_check:
+            print(f'\nCONFIRM PROCEED OR CANCEL IN INPUT BOX!')
+            if not input('Proceed (y/n) ?')=='y': raise NameError('Operation cancelled by user.')
+
+        grid = np.zeros((*Ndim,dummy_model.size))
+
+        # reset counter
+        counter = 0
+
+        print('Computing grid...\n')
+
+        def worker(grid,index_array):
+            global counter
+            global lock
+            '''
+            index_array is a 2D array with each row being the list of indexes to be treated for each parameters:
+            index_array = [[
+                index_of_param1_for_task1 index_of_param2_for_task1 index_of_param3_for_task1 ... index_of_paramM_for_task1
+                index_of_param1_for_task2 index_of_param2_for_task2 index_of_param3_for_task2 ... index_of_paramM_for_task2
+                ...
+                index_of_param1_for_taskN index_of_param2_for_taskN index_of_param3_for_taskN ... index_of_paramM_for_taskN
+            ]]
+            '''
+            for index_list in index_array:
+                # index_list contains the index of each parameter that we're currently treating
+                atmo_params = {}
+                atmo_params['log_MMR'] = {}
+                
+                # fill the atmo parameter dics with current parameters
+                for param_number, index in enumerate(index_list):
+                    param_key = list(parameters.keys())[param_number]
+                    if 'log_MMR' in param_key:
+                        specie = param_key.split('_')[2]
+                        atmo_params['log_MMR'][specie] = parameters[param_key][index]
+                    else:
+                        atmo_params[param_key] = parameters[param_key][index]
+                
+                # compute corresponding model
+                wave, transit_radius = self.compute_pRT(atmo_params)
+
+                # store in grid with memory lock and update counter
+                with lock:
+                    grid[tuple(index_list)] = transit_radius
+                    counter += 1
+                    print(f'\r{((counter+1) / Ntot)*100:.0f} %',end='',flush=True)
+
+        # Compute Grid
+        tstart = time.time()
+
+        if Nb_threads:
+            # Divide all possible combination of parameters into equal parts
+            index_array_list = split_param_combinations(list(parameters.values()),Nb_threads) # one element per thread, which contains a sub-set of every possible combination of parameters sorted in rows
+            threads = []   
+
+            # Assign each thread with its set of parameter combinations
+            for thread_idx in range(Nb_threads):
+                index_array = index_array_list[thread_idx] # array of parameters combinations the thread will work with
+                self.index_array = index_array
+                thread = threading.Thread(target=worker, args=(grid,index_array))
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to finish
+            for thread in threads:
+                thread.join()
+        else:
+            index_array_list = split_param_combinations(list(parameters.values()),1)
+            worker(index_array_list[0])
+        
+        print()
+        print(f'Full grid computed in {time.time() - tstart:.2f} s')
+
+        # Build and save interpoler
+        print('Building and saving interpoler, this can take some time...')
+        interpoler = RegularGridInterpolator(tuple(parameters.values()),grid)
+        
+        with open(output_file+'.pkl', 'wb') as f:
+            pickle.dump(interpoler, f)
+
+        # save a readme for grid info
+        with open(f'{output_file}_readme.txt','w') as f:
+            content = f'''Nb dimension: {len(parameters.keys())}
+                Grid shape: {grid.shape}
+                Dimensions: {parameters.keys()}
+                {parameters}'''
+            f.write(content)
+
+        # also save wave for loading the corresponding wave vector
+        np.savetxt(f'{output_file}_wave.dat',dummy_wave,header='Wavelength [nm]')
+
+        print('All done !')
+
+
+
+
+                    
+
+
+
+
+            
+
+        
+
 
 
 
